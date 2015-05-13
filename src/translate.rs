@@ -8,6 +8,7 @@ pub use self::Expr::*;
 pub struct Grammar {
 	pub imports: Vec<RustUse>,
 	pub rules: Vec<Rule>,
+	pub context_type: Option<String>,
 }
 
 #[derive(Clone)]
@@ -48,19 +49,33 @@ pub enum Expr {
 	ActionExpr(Vec<TaggedExpr>, /*action*/ String, /*cond*/ bool),
 }
 
+#[derive(Clone)]
+struct CtxTok {
+	ctxdefarg: Option<Vec<rustast::TokenTree>>,
+	ctxcallarg: Option<Vec<rustast::TokenTree>>,
+}
+
 pub fn compile_grammar(ctxt: &rustast::ExtCtxt, grammar: &Grammar) -> rustast::P<rustast::Mod> {
+	#![allow(unused_imports)]
+
     let mut imports = grammar.imports.clone();
     imports.push(RustUseList("self::RuleResult".to_string(),
                              vec!("Matched".to_string(), "Failed".to_string())));
     let mut items = translate_view_items(ctxt, &imports);
 
+	let context_type = grammar.context_type.as_ref().map(|x| rustast::parse_type(x));
+	let ctxtok = CtxTok {
+		ctxdefarg: context_type.as_ref().map(|t| quote_tokens!(ctxt, , context: $t)),
+		ctxcallarg: context_type.as_ref().map(|_| quote_tokens!(ctxt, , context))
+	};
+
     items.push_all(&
         header_items(ctxt).into_iter()
 	    .chain(grammar.rules.iter().map(|rule|{
-	        compile_rule(ctxt, rule)
+	        compile_rule(ctxt, rule, &ctxtok)
 	    }))
 	    .chain(grammar.rules.iter().filter(|rule| rule.exported).map(|rule| {
-	        compile_rule_export(ctxt, rule)
+	        compile_rule_export(ctxt, rule, &ctxtok)
 	    }))
 	    .collect::<Vec<_>>());
 
@@ -244,11 +259,11 @@ pub fn header_items(ctxt: &rustast::ExtCtxt) -> Vec<rustast::P<rustast::Item>> {
 }
 
 
-fn compile_rule(ctxt: &rustast::ExtCtxt, rule: &Rule) -> rustast::P<rustast::Item> {
+fn compile_rule(ctxt: &rustast::ExtCtxt, rule: &Rule, ctxtok: &CtxTok) -> rustast::P<rustast::Item> {
 	let ref rule_name = rule.name;
 	let name = rustast::str_to_ident(&format!("parse_{}", rule.name));
 	let ret = rustast::parse_type(&rule.ret_type);
-	let body = compile_expr(ctxt, &*rule.expr, (&rule.ret_type as &str) != "()");
+	let body = compile_expr(ctxt, &*rule.expr, (&rule.ret_type as &str) != "()", ctxtok);
 	let wrapped_body = if cfg!(feature = "trace") {
 		quote_expr!(ctxt, {
 			let (line, col) = pos_to_line(input, pos);
@@ -264,21 +279,25 @@ fn compile_rule(ctxt: &rustast::ExtCtxt, rule: &Rule) -> rustast::P<rustast::Ite
 			__peg_result
 		})
 	} else { body };
+
+	let ctxdefarg = ctxtok.ctxdefarg.clone();
 	(quote_item!(ctxt,
-		fn $name<'input>(input: &'input str, state: &mut ParseState, pos: usize) -> RuleResult<$ret> {
+		fn $name<'input>(input: &'input str, state: &mut ParseState, pos: usize $ctxdefarg) -> RuleResult<$ret> {
 			$wrapped_body
 		}
 	)).unwrap()
 }
 
-fn compile_rule_export(ctxt: &rustast::ExtCtxt, rule: &Rule) -> rustast::P<rustast::Item> {
+fn compile_rule_export(ctxt: &rustast::ExtCtxt, rule: &Rule, ctxtok: &CtxTok) -> rustast::P<rustast::Item> {
 	let name = rustast::str_to_ident(&rule.name);
 	let ret = rustast::parse_type(&rule.ret_type);
 	let parse_fn = rustast::str_to_ident(&format!("parse_{}", rule.name));
+	let CtxTok{ctxdefarg, ctxcallarg} = ctxtok.clone();
+
 	(quote_item!(ctxt,
-		pub fn $name<'input>(input: &'input str) -> ParseResult<$ret> {
+		pub fn $name<'input>(input: &'input str $ctxdefarg) -> ParseResult<$ret> {
 			let mut state = ParseState::new();
-			match $parse_fn(input, &mut state, 0) {
+			match $parse_fn(input, &mut state, 0 $ctxcallarg) {
 				Matched(pos, value) => {
 					if pos == input.len() {
 						return Ok(value)
@@ -298,8 +317,11 @@ fn compile_rule_export(ctxt: &rustast::ExtCtxt, rule: &Rule) -> rustast::P<rusta
 	)).unwrap()
 }
 
-fn compile_match_and_then(ctxt: &rustast::ExtCtxt, e: &Expr, value_name: Option<&str>, then: rustast::P<rustast::Expr>) -> rustast::P<rustast::Expr> {
-	let seq_res = compile_expr(ctxt, e, value_name.is_some());
+fn compile_match_and_then(ctxt: &rustast::ExtCtxt,
+	                      e: &Expr, value_name: Option<&str>,
+	                      then: rustast::P<rustast::Expr>,
+	                      ctxtok: &CtxTok) -> rustast::P<rustast::Expr> {
+	let seq_res = compile_expr(ctxt, e, value_name.is_some(), ctxtok);
 	let name_pat = match value_name {
 		Some(name) => rustast::str_to_ident(name),
 		None => rustast::str_to_ident("_")
@@ -342,7 +364,7 @@ fn format_char_set(invert: bool, cases: &[CharSetCase]) -> String {
 }
 
 #[allow(unused_imports)] // quote_tokens! imports things
-fn compile_expr(ctxt: &rustast::ExtCtxt, e: &Expr, result_used: bool) -> rustast::P<rustast::Expr> {
+fn compile_expr(ctxt: &rustast::ExtCtxt, e: &Expr, result_used: bool, ctxtok: &CtxTok) -> rustast::P<rustast::Expr> {
 	match *e {
 		AnyCharExpr => {
 			quote_expr!(ctxt, any_char(input, state, pos))
@@ -390,33 +412,35 @@ fn compile_expr(ctxt: &rustast::ExtCtxt, e: &Expr, result_used: bool) -> rustast
 		}
 
 		RuleExpr(ref rule_name) => {
+			let ctxcallarg = ctxtok.ctxcallarg.clone();
 			let func = rustast::str_to_ident(&format!("parse_{}", *rule_name));
-			quote_expr!(ctxt, $func(input, state, pos))
+			quote_expr!(ctxt, $func(input, state, pos $ctxcallarg))
 		}
 
 		SequenceExpr(ref exprs) => {
-			fn write_seq(ctxt: &rustast::ExtCtxt, exprs: &[Expr]) -> rustast::P<rustast::Expr> {
+			fn write_seq(ctxt: &rustast::ExtCtxt, exprs: &[Expr], ctxtok: &CtxTok) -> rustast::P<rustast::Expr> {
 				if exprs.len() == 1 {
-					compile_expr(ctxt, &exprs[0], false)
+					compile_expr(ctxt, &exprs[0], false, ctxtok)
 				} else {
-					compile_match_and_then(ctxt, &exprs[0], None, write_seq(ctxt, exprs.tail()))
+					compile_match_and_then(ctxt, &exprs[0], None, write_seq(ctxt, exprs.tail(), ctxtok), ctxtok)
 				}
 			}
 
 			if exprs.len() > 0 {
-				write_seq(ctxt, &exprs)
+				write_seq(ctxt, &exprs, ctxtok)
 			} else {
 				quote_expr!(ctxt, Matched(pos, ()))
 			}
 		}
 
 		ChoiceExpr(ref exprs) => {
-			fn write_choice(ctxt: &rustast::ExtCtxt, exprs: &[Expr], result_used: bool) -> rustast::P<rustast::Expr> {
+			fn write_choice(ctxt: &rustast::ExtCtxt, exprs: &[Expr],
+				            result_used: bool, ctxtok: &CtxTok) -> rustast::P<rustast::Expr> {
 				if exprs.len() == 1 {
-					compile_expr(ctxt, &exprs[0], result_used)
+					compile_expr(ctxt, &exprs[0], result_used, ctxtok)
 				} else {
-					let choice_res = compile_expr(ctxt, &exprs[0], result_used);
-					let next = write_choice(ctxt, exprs.tail(), result_used);
+					let choice_res = compile_expr(ctxt, &exprs[0], result_used, ctxtok);
+					let next = write_choice(ctxt, exprs.tail(), result_used, ctxtok);
 
 					quote_expr!(ctxt, {
 						let choice_res = $choice_res;
@@ -429,14 +453,14 @@ fn compile_expr(ctxt: &rustast::ExtCtxt, e: &Expr, result_used: bool) -> rustast
 			}
 
 			if exprs.len() > 0 {
-				write_choice(ctxt, &exprs, result_used)
+				write_choice(ctxt, &exprs, result_used, ctxtok)
 			} else {
 				quote_expr!(ctxt, Matched(pos, ()))
 			}
 		}
 
 		OptionalExpr(box ref e) => {
-			let optional_res = compile_expr(ctxt, e, result_used);
+			let optional_res = compile_expr(ctxt, e, result_used, ctxtok);
 			quote_expr!(ctxt, match $optional_res {
 				Matched(newpos, value) => { Matched(newpos, Some(value)) },
 				Failed => { Matched(pos, None) },
@@ -444,11 +468,11 @@ fn compile_expr(ctxt: &rustast::ExtCtxt, e: &Expr, result_used: bool) -> rustast
 		}
 
 		Repeat(box ref e, min, max, ref sep) => {
-			let inner = compile_expr(ctxt, e, result_used);
+			let inner = compile_expr(ctxt, e, result_used, ctxtok);
 
 			let match_sep = match *sep {
 				Some(box ref sep) => {
-					let sep_inner = compile_expr(ctxt, sep, false);
+					let sep_inner = compile_expr(ctxt, sep, false, ctxtok);
 					quote_tokens!(ctxt,
 						let pos = if repeat_value.len() > 0 {
 							let sep_res = $sep_inner;
@@ -522,7 +546,7 @@ fn compile_expr(ctxt: &rustast::ExtCtxt, e: &Expr, result_used: bool) -> rustast
 		}
 
 		PosAssertExpr(box ref e) => {
-			let assert_res = compile_expr(ctxt, e, false);
+			let assert_res = compile_expr(ctxt, e, false, ctxtok);
 			quote_expr!(ctxt, {
 				let assert_res = $assert_res;
 				match assert_res {
@@ -533,7 +557,7 @@ fn compile_expr(ctxt: &rustast::ExtCtxt, e: &Expr, result_used: bool) -> rustast
 		}
 
 		NegAssertExpr(box ref e) => {
-			let assert_res = compile_expr(ctxt, e, false);
+			let assert_res = compile_expr(ctxt, e, false, ctxtok);
 			quote_expr!(ctxt, {
 				let assert_res = $assert_res;
 				match assert_res {
@@ -544,12 +568,17 @@ fn compile_expr(ctxt: &rustast::ExtCtxt, e: &Expr, result_used: bool) -> rustast
 		}
 
 		ActionExpr(ref exprs, ref code, is_cond) => {
-			fn write_seq(ctxt: &rustast::ExtCtxt, exprs: &[TaggedExpr], code: &str, is_cond: bool) -> rustast::P<rustast::Expr> {
+			fn write_seq(ctxt: &rustast::ExtCtxt,
+				        exprs: &[TaggedExpr],
+				        code: &str,
+				        is_cond: bool,
+				        ctxtok: &CtxTok) -> rustast::P<rustast::Expr> {
 				match exprs.first() {
 					Some(ref first) => {
 						let name = first.name.as_ref().map(|s| &s[..]);
 						compile_match_and_then(ctxt, &*first.expr, name,
-							write_seq(ctxt, exprs.tail(), code, is_cond)
+							write_seq(ctxt, exprs.tail(), code, is_cond, ctxtok),
+							ctxtok
 						)
 					}
 					None => {
@@ -577,7 +606,7 @@ fn compile_expr(ctxt: &rustast::ExtCtxt, e: &Expr, result_used: bool) -> rustast
 				}
 			}
 
-			let body = write_seq(ctxt, &exprs, &code, is_cond);
+			let body = write_seq(ctxt, &exprs, &code, is_cond, ctxtok);
 			quote_expr!(ctxt, {
 				let start_pos = pos;
 				$body
